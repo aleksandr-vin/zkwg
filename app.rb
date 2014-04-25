@@ -1,9 +1,9 @@
 # default example for async_sinatra gem
 require 'sinatra/async'
 require 'haml'
-require 'zk'
 require 'json'
 require 'logger'
+require 'zk-eventmachine'
 
 
 class App < Sinatra::Base
@@ -12,10 +12,13 @@ class App < Sinatra::Base
   logger = Logger.new(STDOUT)
 
   set :zookeeper_host, '127.0.0.1:2181'
-  set :zk, ZK::Client::Threaded.new(settings.zookeeper_host)
-  
-  attr_reader :sid
 
+  @@zkem = ZK::ZKEventMachine::Client.new(settings.zookeeper_host)
+  logger.debug("Connecting to Zookeeper #{settings.zookeeper_host}")
+  @@zkem.connect do
+    logger.info("Zookeeper #{settings.zookeeper_host} is online")
+  end
+ 
   aget '/' do
     body { haml :ls }
   end
@@ -24,19 +27,27 @@ class App < Sinatra::Base
     path = params[:path]
     path = '/' unless path
 
-    puts "/ls: Registering watcher for #{path}"
-    settings.zk.register(path) do |event|
+    logger.debug("Registering Zookeeper watcher for #{path}")
+    @sub = @@zkem.register(path) do |event|
+      logger.debug("#{event.event_name} from Zookeeper arrived, for path: #{event.path}")
+      @sub.unsubscribe
       if event.node_child?
-        # do something on change
-        names = settings.zk.children(path)
-        body { JSON.dump [:path => path, :children => names] }
+        @@zkem.children(event.path).callback do |val,stat|
+          logger.debug("ZK: #{event.path} children: #{JSON.dump val}")
+          body { JSON.dump [:path => event.path, :children => val, :stat => stat] }
+        end.errback do |ex|
+          logger.error("ZK: #{event.path} exception from children: #{ex}")
+          body { JSON.dump [:path => event.path, :excepton => ex] }
+        end
       else
-        # we know it's a child event
-        body { JSON.dump [:path => path, :event => event] }
+        body { JSON.dump [:path => event.path, :event => event] }
       end
     end
 
     # no run w/o next call, wtf?
-    settings.zk.children(path, :watch => true)
+    @@zkem.children(path, :watch => true).errback do |ex|
+      logger.error("ZK: #{path} exception from children: #{ex}")
+      body { JSON.dump [:path => event.path, :excepton => ex] }
+    end
   end
 end
